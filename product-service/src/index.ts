@@ -2,6 +2,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import express, { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
+import mssql from "mssql";
 import morgan from "morgan";
 import { createClient } from "redis";
 
@@ -17,6 +18,7 @@ type Product = {
   price: number;
   category: string;
 };
+type Category = { id: number; name: string };
 
 type JwtPayload = {
   sub: number;
@@ -37,66 +39,7 @@ const cacheTtl = Number(process.env.CACHE_TTL || 120);
 
 const redis = createClient({ url: redisUrl });
 redis.on("error", (err) => console.error("product-service redis error:", err));
-
-const products: Product[] = [
-  {
-    id: 1,
-    name: "Gaming Laptop",
-    description: "High-performance laptop with RTX graphics",
-    price: 1450,
-    category: "Electronics"
-  },
-  {
-    id: 2,
-    name: "Wireless Mouse",
-    description: "Ergonomic mouse with silent click",
-    price: 35,
-    category: "Electronics"
-  },
-  {
-    id: 3,
-    name: "Office Chair",
-    description: "Adjustable lumbar support chair",
-    price: 220,
-    category: "Furniture"
-  },
-  {
-    id: 4,
-    name: "Mechanical Keyboard",
-    description: "RGB backlit keyboard with blue switches",
-    price: 95,
-    category: "Electronics"
-  },
-  {
-    id: 5,
-    name: "Water Bottle",
-    description: "Insulated stainless steel bottle 750ml",
-    price: 18,
-    category: "Accessories"
-  },
-  {
-    id: 6,
-    name: "Backpack",
-    description: "Water-resistant daily backpack with laptop sleeve",
-    price: 60,
-    category: "Accessories"
-  },
-  {
-    id: 7,
-    name: "Desk Lamp",
-    description: "LED lamp with brightness control",
-    price: 42,
-    category: "Home"
-  },
-  {
-    id: 8,
-    name: "Running Shoes",
-    description: "Lightweight shoes for daily training",
-    price: 110,
-    category: "Sports"
-  }
-];
-let nextId = products.length + 1;
+let dbPool: mssql.ConnectionPool | null = null;
 
 const messages: Record<Lang, Record<string, string>> = {
   en: {
@@ -168,14 +111,27 @@ app.get("/products", async (req, res) => {
     return res.json({ source: "cache", products: JSON.parse(cached) });
   }
 
-  const filtered = products.filter((p) => {
-    const categoryOk = category ? p.category.toLowerCase() === category.toLowerCase() : true;
-    const queryOk = q
-      ? p.name.toLowerCase().includes(q.toLowerCase()) ||
-        p.description.toLowerCase().includes(q.toLowerCase())
-      : true;
-    return categoryOk && queryOk;
-  });
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+
+  const query = `
+    SELECT id, name, description, price, category
+    FROM products
+    WHERE (@category = '' OR LOWER(category) = LOWER(@category))
+      AND (
+        @q = ''
+        OR LOWER(name) LIKE '%' + LOWER(@q) + '%'
+        OR LOWER(description) LIKE '%' + LOWER(@q) + '%'
+      )
+    ORDER BY id
+  `;
+  const dbResult = await dbPool
+    .request()
+    .input("category", mssql.NVarChar, category)
+    .input("q", mssql.NVarChar, q)
+    .query<Product>(query);
+  const filtered = dbResult.recordset;
 
   await redis.set(cacheKey, JSON.stringify(filtered), { EX: cacheTtl });
   return res.json({ source: "db", products: filtered });
@@ -191,7 +147,15 @@ app.get("/products/:id", async (req, res) => {
     return res.json({ source: "cache", product: JSON.parse(cached) });
   }
 
-  const product = products.find((p) => p.id === id);
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+
+  const dbResult = await dbPool
+    .request()
+    .input("id", mssql.Int, id)
+    .query<Product>("SELECT id, name, description, price, category FROM products WHERE id = @id");
+  const product = dbResult.recordset[0];
   if (!product) {
     return res.status(404).json({ message: t(lang, "notFound") });
   }
@@ -200,10 +164,59 @@ app.get("/products/:id", async (req, res) => {
   return res.json({ source: "db", product });
 });
 
+app.get("/categories", async (_req, res) => {
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+  const result = await dbPool.query<Category>("SELECT id, name FROM categories ORDER BY name");
+  return res.json({ categories: result.recordset });
+});
+
+app.post("/categories", auth, requireAdmin, async (req, res) => {
+  const { name } = req.body as { name: string };
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+  if (!name?.trim()) {
+    return res.status(400).json({ message: "Category name is required" });
+  }
+  const exists = await dbPool
+    .request()
+    .input("name", mssql.NVarChar, name.trim())
+    .query<Category>("SELECT TOP 1 id, name FROM categories WHERE LOWER(name) = LOWER(@name)");
+  if (exists.recordset.length > 0) {
+    return res.status(409).json({ message: "Category already exists" });
+  }
+  const inserted = await dbPool
+    .request()
+    .input("name", mssql.NVarChar, name.trim())
+    .query<Category>("INSERT INTO categories (name) OUTPUT INSERTED.id, INSERTED.name VALUES (@name)");
+  return res.status(201).json({ category: inserted.recordset[0] });
+});
+
 app.post("/products", auth, requireAdmin, async (req: Request, res) => {
   const { name, description, price, category } = req.body as Omit<Product, "id">;
-  const product: Product = { id: nextId++, name, description, price, category };
-  products.push(product);
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+  const categoryExists = await dbPool
+    .request()
+    .input("category", mssql.NVarChar, category)
+    .query("SELECT TOP 1 id FROM categories WHERE LOWER(name) = LOWER(@category)");
+  if (categoryExists.recordset.length === 0) {
+    return res.status(400).json({ message: "Category does not exist" });
+  }
+
+  const inserted = await dbPool
+    .request()
+    .input("name", mssql.NVarChar, name)
+    .input("description", mssql.NVarChar, description)
+    .input("price", mssql.Decimal(10, 2), price)
+    .input("category", mssql.NVarChar, category)
+    .query<Product>(
+      "INSERT INTO products (name, description, price, category) OUTPUT INSERTED.id, INSERTED.name, INSERTED.description, INSERTED.price, INSERTED.category VALUES (@name, @description, @price, @category)"
+    );
+  const product = inserted.recordset[0];
   await invalidateProductsCache();
   return res.status(201).json({ product });
 });
@@ -211,35 +224,126 @@ app.post("/products", auth, requireAdmin, async (req: Request, res) => {
 app.put("/products/:id", auth, requireAdmin, async (req: Request, res) => {
   const lang = detectLang(req.header("accept-language"));
   const id = Number(req.params.id);
-  const idx = products.findIndex((p) => p.id === id);
-  if (idx === -1) {
-    return res.status(404).json({ message: t(lang, "notFound") });
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
   }
 
-  products[idx] = { ...products[idx], ...req.body, id };
+  const existing = await dbPool
+    .request()
+    .input("id", mssql.Int, id)
+    .query<Product>("SELECT id, name, description, price, category FROM products WHERE id = @id");
+  if (existing.recordset.length === 0) {
+    return res.status(404).json({ message: t(lang, "notFound") });
+  }
+  const merged = { ...existing.recordset[0], ...(req.body as Partial<Product>), id };
+  await dbPool
+    .request()
+    .input("id", mssql.Int, id)
+    .input("name", mssql.NVarChar, merged.name)
+    .input("description", mssql.NVarChar, merged.description)
+    .input("price", mssql.Decimal(10, 2), merged.price)
+    .input("category", mssql.NVarChar, merged.category)
+    .query(
+      "UPDATE products SET name = @name, description = @description, price = @price, category = @category WHERE id = @id"
+    );
   await invalidateProductsCache();
-  return res.json({ product: products[idx] });
+  return res.json({ product: merged });
 });
 
 app.delete("/products/:id", auth, requireAdmin, async (req: Request, res) => {
   const lang = detectLang(req.header("accept-language"));
   const id = Number(req.params.id);
-  const idx = products.findIndex((p) => p.id === id);
-  if (idx === -1) {
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+  const deleted = await dbPool.request().input("id", mssql.Int, id).query(
+    "DELETE FROM products OUTPUT DELETED.id WHERE id = @id"
+  );
+  if (deleted.recordset.length === 0) {
     return res.status(404).json({ message: t(lang, "notFound") });
   }
-
-  products.splice(idx, 1);
   await invalidateProductsCache();
   return res.status(204).send();
 });
+
+const ensureDb = async (): Promise<void> => {
+  const host = process.env.DB_HOST || "sqlserver";
+  const dbPort = Number(process.env.DB_PORT || 1433);
+  const user = process.env.DB_USER || "sa";
+  const password = process.env.DB_PASSWORD || "StrongPass123!";
+  const dbName = process.env.DB_NAME || "docker_shop";
+  const baseConfig: mssql.config = {
+    user,
+    password,
+    server: host,
+    port: dbPort,
+    options: { encrypt: false, trustServerCertificate: true }
+  };
+
+  const masterPool = await mssql.connect({ ...baseConfig, database: "master" });
+  await masterPool
+    .request()
+    .input("dbName", mssql.NVarChar, dbName)
+    .query("IF DB_ID(@dbName) IS NULL EXEC('CREATE DATABASE [' + @dbName + ']')");
+  await masterPool.close();
+
+  dbPool = await mssql.connect({ ...baseConfig, database: dbName });
+  await dbPool.query(`
+    IF OBJECT_ID('categories', 'U') IS NULL
+    BEGIN
+      CREATE TABLE categories (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(255) NOT NULL UNIQUE
+      );
+    END;
+    IF OBJECT_ID('products', 'U') IS NULL
+    BEGIN
+      CREATE TABLE products (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(255) NOT NULL,
+        description NVARCHAR(MAX) NOT NULL,
+        price DECIMAL(10,2) NOT NULL,
+        category NVARCHAR(255) NOT NULL
+      );
+    END
+  `);
+
+  const countResult = await dbPool.query<{ count: number }>("SELECT COUNT(*) AS count FROM products");
+  if (countResult.recordset[0].count === 0) {
+    await dbPool.query(`
+      INSERT INTO products (name, description, price, category) VALUES
+      ('Gaming Laptop', 'High-performance laptop with RTX graphics', 1450, 'Electronics'),
+      ('Wireless Mouse', 'Ergonomic mouse with silent click', 35, 'Electronics'),
+      ('Office Chair', 'Adjustable lumbar support chair', 220, 'Furniture'),
+      ('Mechanical Keyboard', 'RGB backlit keyboard with blue switches', 95, 'Electronics'),
+      ('Water Bottle', 'Insulated stainless steel bottle 750ml', 18, 'Accessories'),
+      ('Backpack', 'Water-resistant daily backpack with laptop sleeve', 60, 'Accessories'),
+      ('Desk Lamp', 'LED lamp with brightness control', 42, 'Home'),
+      ('Running Shoes', 'Lightweight shoes for daily training', 110, 'Sports')
+    `);
+  }
+
+  await dbPool.query(`
+    INSERT INTO categories (name)
+    SELECT DISTINCT p.category
+    FROM products p
+    WHERE NOT EXISTS (
+      SELECT 1 FROM categories c WHERE LOWER(c.name) = LOWER(p.category)
+    )
+  `);
+};
 
 redis
   .connect()
   .catch((error) => {
     console.error("product-service redis connect failed:", error);
   })
-  .finally(() => {
+  .finally(async () => {
+    try {
+      await ensureDb();
+    } catch (error) {
+      console.error("product-service mssql init failed:", error);
+    }
     app.listen(port, () => {
       console.log(`product-service listening on port ${port}`);
     });

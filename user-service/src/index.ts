@@ -1,8 +1,8 @@
-import amqp from "amqplib";
 import cors from "cors";
 import dotenv from "dotenv";
 import express, { NextFunction, Request, Response } from "express";
 import jwt from "jsonwebtoken";
+import mssql from "mssql";
 import morgan from "morgan";
 
 dotenv.config();
@@ -31,10 +31,7 @@ app.use(morgan("dev"));
 
 const port = Number(process.env.PORT || 4002);
 const jwtSecret = process.env.JWT_SECRET || "secret";
-const rabbitUrl = process.env.RABBITMQ_URL || "amqp://rabbitmq:5672";
-const exchange = process.env.RABBITMQ_EXCHANGE || "shop.events";
-
-const users = new Map<number, UserProfile>();
+let dbPool: mssql.ConnectionPool | null = null;
 
 const messages: Record<Lang, Record<string, string>> = {
   en: {
@@ -81,12 +78,25 @@ app.get("/health", (req, res) => {
 
 app.get("/me", auth, (req: AuthRequest, res) => {
   const lang = detectLang(req.header("accept-language"));
-  const user = users.get(Number(req.user?.sub));
-  if (!user) {
-    return res.status(404).json({ message: t(lang, "notFound") });
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
   }
-
-  return res.json({ user });
+  const userId = Number(req.user?.sub);
+  dbPool
+    .request()
+    .input("id", mssql.Int, userId)
+    .query<UserProfile>("SELECT id, name, email, role FROM users WHERE id = @id")
+    .then((result) => {
+      const user = result.recordset[0];
+      if (!user) {
+        return res.status(404).json({ message: t(lang, "notFound") });
+      }
+      return res.json({ user });
+    })
+    .catch((error) => {
+      console.error("user-service /me error:", error);
+      return res.status(500).json({ message: "Internal server error" });
+    });
 });
 
 app.get("/users/:id", auth, (req: AuthRequest, res) => {
@@ -99,7 +109,61 @@ app.get("/users/:id", auth, (req: AuthRequest, res) => {
     return res.status(403).json({ message: t(lang, "forbidden") });
   }
 
-  const user = users.get(targetId);
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+  dbPool
+    .request()
+    .input("id", mssql.Int, targetId)
+    .query<UserProfile>("SELECT id, name, email, role FROM users WHERE id = @id")
+    .then((result) => {
+      const user = result.recordset[0];
+      if (!user) {
+        return res.status(404).json({ message: t(lang, "notFound") });
+      }
+      return res.json({ user });
+    })
+    .catch((error) => {
+      console.error("user-service /users/:id error:", error);
+      return res.status(500).json({ message: "Internal server error" });
+    });
+});
+
+app.get("/users", auth, async (req: AuthRequest, res) => {
+  const lang = detectLang(req.header("accept-language"));
+  if (req.user?.role !== "Admin") {
+    return res.status(403).json({ message: t(lang, "forbidden") });
+  }
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+  const result = await dbPool.query<UserProfile>("SELECT id, name, email, role FROM users ORDER BY id");
+  return res.json({ users: result.recordset });
+});
+
+app.patch("/users/:id/role", auth, async (req: AuthRequest, res) => {
+  const lang = detectLang(req.header("accept-language"));
+  if (req.user?.role !== "Admin") {
+    return res.status(403).json({ message: t(lang, "forbidden") });
+  }
+  if (!dbPool) {
+    return res.status(503).json({ message: "Database is not ready" });
+  }
+
+  const id = Number(req.params.id);
+  const role = String(req.body.role || "") as Role;
+  if (role !== "Admin" && role !== "Customer") {
+    return res.status(400).json({ message: "Invalid role" });
+  }
+
+  const result = await dbPool
+    .request()
+    .input("id", mssql.Int, id)
+    .input("role", mssql.NVarChar, role)
+    .query<UserProfile>(
+      "UPDATE users SET role = @role OUTPUT INSERTED.id, INSERTED.name, INSERTED.email, INSERTED.role WHERE id = @id"
+    );
+  const user = result.recordset[0];
   if (!user) {
     return res.status(404).json({ message: t(lang, "notFound") });
   }
@@ -108,22 +172,44 @@ app.get("/users/:id", auth, (req: AuthRequest, res) => {
 });
 
 const bootstrap = async (): Promise<void> => {
-  const connection = await amqp.connect(rabbitUrl);
-  const channel = await connection.createChannel();
-  await channel.assertExchange(exchange, "topic", { durable: false });
-  const queue = await channel.assertQueue("", { exclusive: true });
-  await channel.bindQueue(queue.queue, exchange, "user.registered");
+  const host = process.env.DB_HOST || "sqlserver";
+  const dbPort = Number(process.env.DB_PORT || 1433);
+  const user = process.env.DB_USER || "sa";
+  const password = process.env.DB_PASSWORD || "StrongPass123!";
+  const dbName = process.env.DB_NAME || "docker_shop";
+  const baseConfig: mssql.config = {
+    user,
+    password,
+    server: host,
+    port: dbPort,
+    options: { encrypt: false, trustServerCertificate: true }
+  };
 
-  channel.consume(queue.queue, (msg) => {
-    if (!msg) return;
-    const payload = JSON.parse(msg.content.toString()) as UserProfile;
-    users.set(payload.id, payload);
-  });
+  const masterPool = await mssql.connect({ ...baseConfig, database: "master" });
+  await masterPool
+    .request()
+    .input("dbName", mssql.NVarChar, dbName)
+    .query("IF DB_ID(@dbName) IS NULL EXEC('CREATE DATABASE [' + @dbName + ']')");
+  await masterPool.close();
+
+  dbPool = await mssql.connect({ ...baseConfig, database: dbName });
+  await dbPool.query(`
+    IF OBJECT_ID('users', 'U') IS NULL
+    BEGIN
+      CREATE TABLE users (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(255) NOT NULL,
+        email NVARCHAR(255) NOT NULL UNIQUE,
+        passwordHash NVARCHAR(255) NOT NULL,
+        role NVARCHAR(50) NOT NULL
+      );
+    END
+  `);
 };
 
 bootstrap()
   .catch((error) => {
-    console.error("user-service rabbit init failed:", error);
+    console.error("user-service bootstrap init failed:", error);
   })
   .finally(() => {
     app.listen(port, () => {

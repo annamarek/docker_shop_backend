@@ -12,6 +12,7 @@
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
+    "mssql": "^12.3.1",
     "redis": "^5.8.2"
   },
   "devDependencies": {
@@ -19,6 +20,7 @@
     "@types/express": "^5.0.3",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/morgan": "^1.9.10",
+    "@types/mssql": "^12.3.0",
     "@types/node": "^24.5.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.9.2"
